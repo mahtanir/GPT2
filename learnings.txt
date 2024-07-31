@@ -1,0 +1,6 @@
+
+* ModelDict 
+* GPT architecture with the layer norms and no cross attention 
+* MPS on mac
+* GELU (basically ReLU but no dead gradients)
+* How to copy and transfer weights. .copy_ + how the layers in state_dict for a model are actually named. 
