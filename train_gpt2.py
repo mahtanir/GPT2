@@ -4,6 +4,7 @@ import time
 import inspect
 from dataclasses import dataclass
 import torch
+import tiktoken
 import torch.nn as nn
 from torch.nn import functional as F
 # from hellaswag import render_example, iterate_examples
@@ -15,6 +16,34 @@ class GPTConfig: #basically an enum
     n_layer: int = 12 #number of decoder layers (casual, sel attention, mlp and the pre-add norms for each respective)
     n_heads: int = 12
     n_embed = 768 
+
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B 
+        self.T = T
+        with open('input.txt', 'r') as file:
+            text = file.read() 
+        enc = tiktoken.get_encoding('gpt2')
+        data = enc.encode(text)
+        self.starting_point = 0 
+        self.tokens = torch.tensor(data)
+        print(f"This is the length of the input {len(self.tokens)}")
+        print(f"1 epoch is {len(self.tokens) // (B*T)} batches")
+    
+    def next_batch(self):
+        subset = self.tokens[self.starting_point: self.starting_point + self.B*self.T + 1]
+        x = subset[:-1].view(self.B, self.T)
+        y = subset[1:].view(self.B, self.T)
+        self.starting_point += self.T*self.B
+
+        if self.starting_point + self.T*self.B + 1 > len(self.tokens):
+            self.starting_point = 0 
+        
+        return x,y
+
+
+        
 
 
 class CasualSelfAttention(nn.Module):
@@ -87,6 +116,28 @@ class GPT(nn.Module):
             )
         )
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False) #this is the classification layer.
+
+        #weight sharing scheme: we impose a bias that can speed up training. In GPT2 weights from word embedding layer and head classifer linear layer are the same weights. We want
+        #similar words to have similar embeddings, and similar words to be mapped to the same subsequent word and therefore transitively similar embeddings as well. 
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply()
+    
+    def init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            #module weight is the reference pointer i.e see above 
+            nn.init.normal_(module.weight, mean=0.0, std=0.02) #this is basically 1/root(d_embed like Xavier initialisation)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+
+        #can also do this approach instead of appl yif you initialise model first: 
+        # for child in model.children():
+        #     if isinstance(child, nn.Linear):
+        #         nn.init.xavier_uniform_(child.weight)
+
     
     def forward(self, idx, targets=None):
         B, T = idx.size() #this is the input of shape B, T -> can also do .shape )i's post tokenisation. 
@@ -133,15 +184,15 @@ class GPT(nn.Module):
         config_args['block_size'] = 1024 
         config = GPTConfig(**config_args)
         model = GPT(config) #weird, doesn't take in any params 
-        sd = model.state_dict() 
+        sd = model.state_dict() #can use .copy_(state_dict[other_model]) instead in order to load the weights. equivalnt to load state dict but that's without the state_dict function just the model. 
         sd_keys = sd.keys()
         sd_keys = [key for key in sd_keys if not key.endswith('.attention.bias')]
 
         #init a hugging face/transformers model 
 
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-        sd_keys_hf = sd_hf.keys()
+        sd_hf = model_hf.state_dict() 
+        sd_keys_hf = sd_hf.keys() 
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('attn.masked_bias')]
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('attn.bias')]
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
@@ -156,7 +207,7 @@ class GPT(nn.Module):
                     sd[key].copy_(sd_hf[key].t()) #we are copying the weights sd[key] is a tensor
             else:
                  assert sd_keys_hf.shape == sd_keys[key].shape
-                 sd[key].copy_(sd_keys_hf[key])
+                 sd[key].copy_(sd_hf[key])
         
         return model
     
@@ -172,24 +223,12 @@ elif hasattr(torch.backends('mps')) and torch.backends.mps.is_available():
     device = 'mps'
 print('device', device)
 
-model = GPT.from_pretrained('gpt2')
-#to train from scratch we comment out prior line and do model = GPT(GPTConfig()) #params are randomly initialised by default with pytorch ie Xavieri nitialisation. 
-model.eval()
-model.to(device)
-print("didn't crash yay!")
+# model = GPT.from_pretrained('gpt2')
+# #to train from scratch we comment out prior line and do model = GPT(GPTConfig()) #params are randomly initialised by default with pytorch ie Xavieri nitialisation. 
+# model.to(device)
+# print("didn't crash yay!")
+train_loader = DataLoaderLite(B=4, T=32)
 
-import tiktoken 
-enc = tiktoken.get_encoding('gpt2')
-#---- data loader -----#
-with open('input.txt', 'r') as file:
-    data = file.read()
-data = data[:1000]
-data = enc.encode(data)
-B, T = 4, 32
-buf = torch.tensor(data[:B*T + 1]) #first we get the necessary amount of tokens  (i.e get 1000 sample, encode, get subset of B*T + 1, then split into x,y tensors then initialise model and put in)
-buf = buf.to(device)
-x = buf[:-1].view(B,T) 
-y = buf[1:].view(B,T)
 
 #get logits
 model = GPT(GPTConfig())
@@ -198,14 +237,15 @@ model.to(device)
 # print(loss) #we expect the loss here to be around -log(1/vocab_size) since in the beginning should be randomly initialised and equally probable. i.e cross entropy loss 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    x, y = train_loader.next_batch()
+    x , y = x.to(device), y.to(device) #we only move them to device here as we want as much to be done on cpu as possible. I.e tokens = enc.encode(text) is large, only want subjects of B*t to be on GPU
     optimizer.zero_grad()
     y_pred, loss = model(x,y)
+    loss.backward()
     optimizer.step()
     print(loss.item())
-
-
+# a lot of the intial loss gain will just come from deleting the useless tokens or the tokens that we're never going to use. 
 import sys ; sys.exit() 
-
 
 
 tokens = enc.encode('Hello, I am a language model, ')
