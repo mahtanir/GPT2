@@ -52,6 +52,7 @@ class CasualSelfAttention(nn.Module):
         assert config.n_embed % config.n_heads == 0 
         self.c_attn = nn.Linear(config.n_embed, config.n_embed * 3) #this is named conventionally similar to hugging face import. All of these layers have weights except the buffer. 
         self.c_proj = nn.Linear(config.n_embed, config.n_embed)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_heads
         self.d_head =  config.n_embed // config.n_heads 
         self.n_embed = config.n_embed 
@@ -64,6 +65,9 @@ class CasualSelfAttention(nn.Module):
         Q = Q.view(B, T , self.n_heads, self.d_head).transpose(1,2) #making the n_head dim like batch so computed in || 
         K = K.view(B, T , self.n_heads, self.d_head).transpose(1,2) 
         V = V.view(B, T , self.n_heads, self.d_head).transpose(1,2) 
+       
+       #---can be replaced with flash attention. torch.compile although doing kernel fusion is not able to kernel fusion over here; Flash attention actually has more tflops but it more mindful of memory hierarchy so upto 7.6x faster------#
+       # in particular, the N*N attention score matrix never is materialised or written to memory / HBM -> GPU memory. # 
         attention = (Q @ K.transpose(-1,-2)) / (math.sqrt(self.d_head))
         attention = attention.masked_fill(self.bias[:, :, T, T] == 0, float('-inf')) #is this not the entire tensor in any case??? Unless T is not actually config.block_size, but rather the size of text. 
         attention = F.softmax(attention, dim=-1)
@@ -79,6 +83,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embed, config.n_embed * 4)
         self.gelu = nn.GELU(approximate='tanh') #approximate not necessary any more. GELU like RELU but no dead weights i.e gradient != 0
         self.c_proj = nn.Linear(config.n_embed * 4, config.n_embed)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
     
     def forward(self, x):
         x = self.c_fc(x)
@@ -121,12 +126,16 @@ class GPT(nn.Module):
         #similar words to have similar embeddings, and similar words to be mapped to the same subsequent word and therefore transitively similar embeddings as well. 
         self.transformer.wte.weight = self.lm_head.weight
 
-        self.apply()
+        self.apply(self.init_weights)
     
     def init_weights(self, module):
+        std = 0.02
         if isinstance(module, nn.Linear):
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2*self.config.n_layer)**-0.5 #this is done to control the variance because every time this layer has a residual path layer the variance increases. *2 because attention and mlp in block residuals. Not sure why only c_proj and not the other linears. 
+
             #module weight is the reference pointer i.e see above 
-            nn.init.normal_(module.weight, mean=0.0, std=0.02) #this is basically 1/root(d_embed like Xavier initialisation)
+            nn.init.normal_(module.weight, mean=0.0, std=std) #this is basically 1/root(d_embed like Xavier initialisation)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -223,27 +232,48 @@ elif hasattr(torch.backends('mps')) and torch.backends.mps.is_available():
     device = 'mps'
 print('device', device)
 
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
 # model = GPT.from_pretrained('gpt2')
 # #to train from scratch we comment out prior line and do model = GPT(GPTConfig()) #params are randomly initialised by default with pytorch ie Xavieri nitialisation. 
 # model.to(device)
 # print("didn't crash yay!")
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=16, T=1024) #use as high B as u can on GPU and keep the value to the power of 2. 
 
+torch.set_float32_matmul_precision('high') #changing from FP to TF32 which reduces tfops or multiplication/addition tensor operations to speed things up - sacrifices some precisions. By default we're floating point 32 in pytorch.
+#https://www.nvidia.com/en-us/data-center/a100/ 
 
 #get logits
 model = GPT(GPTConfig())
 model.to(device)
+model = torch.compile(model=model) #we should almost always do this. Much more efficient. 2-3x training (refer to the screenshot). Previously for each operation (i.e gelu tanh approximate), we would 
+#previously get input from memory, compute it in gpu, and then move back to memory, and keep going back and forth till all opps are done. But compile first gets rid of the python interpreator and allows 
+#for like a single round trip to compute everything while at the gpu itself, perhaps by potentially using a bit of the memroy within the gpu itself (although limited in capacity). ALSO, speeds up python
+#by removing python interpreter from forward pass entirely and running whole code holisticlly much faster (not eager mode). 
+
 # y_pred, loss = model(x, y) 
 # print(loss) #we expect the loss here to be around -log(1/vocab_size) since in the beginning should be randomly initialised and equally probable. i.e cross entropy loss 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x , y = x.to(device), y.to(device) #we only move them to device here as we want as much to be done on cpu as possible. I.e tokens = enc.encode(text) is large, only want subjects of B*t to be on GPU
     optimizer.zero_grad()
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):#doesn't convert all to bfloat but some tensors. I.e layernorm stuff not changed. 
+        logits, loss = model(x,y)
     y_pred, loss = model(x,y)
+    # import code; code.interact(local=locals()) #a way to interrupt code and type something in terminal. Could be useful for debugging. 
     loss.backward()
     optimizer.step()
     print(loss.item())
+    torch.cuda.synchronize() #CPU delegates tasks to the GPU. Kinda like async await. Need to await for all GPU processes above to complete and that's what this line does. 
+    t1 = time.time()
+    time_diff = (t1-t0)*1000
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0) #B*T are the number of tokens processed by the model 
+    print(f"step {i}: loss {loss.item()}, dt: {time_diff:.2f} ms, {tokens_per_sec:.2f} tok/sec")
+
 # a lot of the intial loss gain will just come from deleting the useless tokens or the tokens that we're never going to use. 
 import sys ; sys.exit() 
 
